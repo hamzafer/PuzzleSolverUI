@@ -1,0 +1,11 @@
+name: puzzlesolver
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pytorch
+  - torchvision
+  - pip
+  - pip:
+      - timm==0.4.12
