@@ -1,57 +1,138 @@
-# api/models.py
-
 import os
 import sys
 import torch
+import torch.nn as nn
 import numpy as np
-from typing import List, Dict, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Type
+import matplotlib.pyplot as plt
 from einops import rearrange
 from sklearn.metrics import pairwise_distances
+from PIL import Image
+from torchvision import transforms
 
-# Make sure we can import JPDVT internals
+from .base_model import PuzzleSolverModel
+
+# Add external module paths to Python path
+sys.path.append('/cluster/home/muhamhz/fcvit-mt-ntnu')
+sys.path.append('/cluster/home/muhamhz/JPDVT')
 sys.path.append('/cluster/home/muhamhz/JPDVT/image_model')
+
+# Import for the first model FCViT
+from puzzle_fcvit import FCViT
+
+# Imports for the second model JPDVT
 from diffusion import create_diffusion
 import models as jpdvt_models            # JPDVT/image_model/models.py
 from models import DiT_models, get_2d_sincos_pos_embed
 
-# Make sure we can import FCViT
-sys.path.append('/cluster/home/muhamhz/fcvit-mt-ntnu')
-from puzzle_fcvit import FCViT
-from torchvision import transforms
 
-# Your base interface
-from .base_model import PuzzleSolverModel
+class FCViTSolver(PuzzleSolverModel):
+    """FCViT model for puzzle solving"""
+    
+    def __init__(self, checkpoint_path, backbone="vit_base_patch16_224", 
+                 size_fragment=75, num_fragment=9, puzzle_size=225):
+        self.checkpoint_path = checkpoint_path
+        self.backbone = backbone
+        self.size_fragment = size_fragment
+        self.num_fragment = num_fragment
+        self.puzzle_size = puzzle_size
+        self.model = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+    @property
+    def name(self) -> str:
+        return "FCViT"
+    
+    @property
+    def description(self) -> str:
+        return "Vision Transformer model for solving image puzzles"
+    
+    def load_model(self) -> None:
+        """Load FCViT model weights"""
+        if self.model is not None:
+            return
+            
+        self.model = FCViT(
+            backbone=self.backbone, 
+            num_fragment=self.num_fragment, 
+            size_fragment=self.size_fragment
+        ).to(self.device)
+        
+        ckpt = torch.load(self.checkpoint_path, map_location="cpu", weights_only=True)
+        state = {k.replace("module.", "", 1): v for k, v in ckpt["model"].items()}
+        self.model.load_state_dict(state, strict=True)
+        self.model.eval()
+        self.model.augment_fragment = transforms.Resize(
+            (self.size_fragment, self.size_fragment), 
+            antialias=True
+        )
+        
+    def solve(self, puzzle_img: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """Solve puzzle using FCViT model"""
+        if self.model is None:
+            self.load_model()
+            
+        # Move to device
+        puzzle_img = puzzle_img.to(self.device)
+        
+        # Perform inference
+        with torch.no_grad():
+            pred_gpu, tgt_gpu = self.model(puzzle_img)
+        
+        pred_ = self.model.mapping(pred_gpu.clone())
+        
+        # Make sure map_coord is on the same device as pred_
+        map_coord = self.model.map_coord.to(pred_.device)
+        
+        # Extract the ordering information
+        mask_pred = (pred_[0][:, None, :] == map_coord).all(-1).long()
+        pred_indices = mask_pred.argmax(dim=1).tolist()
+        
+        # Move tensors back to CPU for post-processing
+        img_cpu = puzzle_img[0].cpu()
+        
+        # Visualize using model's unshuffling logic
+        def unshuffle(tensor, order):
+            C, H, W = tensor.shape
+            p = self.size_fragment
+            pieces = [tensor[:, i:i+p, j:j+p] for i in range(0, H, p) for j in range(0, W, p)]
+            grid = [pieces[idx] for idx in order]
+            rows = [torch.cat(grid[i:i+3], dim=2) for i in range(0, 9, 3)]
+            return torch.cat(rows, dim=1)
+        
+        # Reconstruct the image
+        reconstructed = unshuffle(img_cpu, pred_indices)
+        
+        return reconstructed.unsqueeze(0), {"order": pred_indices}
 
 
 class JPDVTSolver(PuzzleSolverModel):
-    """Exact port of your working JPDVT inference for a single scrambled image."""
-
-    def __init__(self,
-                 checkpoint_path: str,
-                 image_size: int = 192,
-                 grid_size: int = 3,
-                 num_steps: int = 250):
+    """JPDVT diffusion model for puzzle solving (fully working port)"""
+    
+    def __init__(self, checkpoint_path, model_name="JPDVT", image_size=192, grid_size=3, num_steps=250):
         self.checkpoint_path = checkpoint_path
+        self.model_name      = model_name
         self.image_size      = image_size
         self.grid_size       = grid_size
         self.num_steps       = num_steps
-        self.device          = "cuda" if torch.cuda.is_available() else "cpu"
         self.model           = None
         self.diffusion       = None
-
+        self.device          = "cuda" if torch.cuda.is_available() else "cpu"
+        
     @property
     def name(self) -> str:
-        return "jpdvt"
-
+        return "JPDVT"
+    
     @property
     def description(self) -> str:
-        return "Diffusion-based JPDVT solver"
-
+        return "Diffusion-based model for solving image puzzles"
+    
     def load_model(self) -> None:
+        """Load JPDVT model weights and patch the embedder"""
         if self.model is not None:
             return
-
-        # Monkey-patch PatchEmbed to ignore bias kwarg
+            
+        # Monkey-patch PatchEmbed to swallow bias kwarg
         if not hasattr(jpdvt_models.PatchEmbed, "_orig_init"):
             jpdvt_models.PatchEmbed._orig_init = jpdvt_models.PatchEmbed.__init__
             def _patched_init(self, img_size, patch_size, in_chans, embed_dim, bias=False, *a, **k):
@@ -60,70 +141,54 @@ class JPDVTSolver(PuzzleSolverModel):
                 )
             jpdvt_models.PatchEmbed.__init__ = _patched_init
 
-        # 1) instantiate DiT
-        self.model = DiT_models["JPDVT"](input_size=self.image_size).to(self.device)
-
-        # 2) load checkpoint
-        state = torch.load(self.checkpoint_path, map_location=self.device)
-        sd = state.get("model", state)
+        # Instantiate the DiT model
+        self.model = DiT_models[self.model_name](input_size=self.image_size).to(self.device)
+        
+        # Load checkpoint (handles both {"model":{...}} or raw)
+        state_dict = torch.load(self.checkpoint_path, map_location=self.device)
+        sd = state_dict.get('model', state_dict)
         own = self.model.state_dict()
-        filtered = {k: v for k, v in sd.items() if k in own}
-        self.model.load_state_dict(filtered, strict=False)
-
-        # 3) batchnorm mode
+        pretrained = {k: v for k, v in sd.items() if k in own}
+        self.model.load_state_dict(pretrained, strict=False)
+        
+        # BatchNorm hack
         self.model.train()
-
-        # 4) diffusion sampler
+        
+        # Create diffusion sampler
         self.diffusion = create_diffusion(str(self.num_steps))
-
-    def find_permutation(self, dist_mat: np.ndarray) -> List[int]:
-        """
-        Greedy algorithm to find the permutation order based on the distance matrix.
-        Handles empty arrays gracefully by skipping assignment when empty.
-        """
+        
+    def find_permutation(self, distance_matrix: np.ndarray) -> List[int]:
+        """Greedy algorithm, safe on empty arrays."""
         sort_list = []
-        tmp = dist_mat.copy()
-        n = dist_mat.shape[1]
+        tmp = distance_matrix.copy()
+        n = distance_matrix.shape[1]
         for _ in range(n):
-            # pick the patch with smallest distance in the first column
             idx = int(tmp[:, 0].argmin())
             sort_list.append(idx)
-            # remove that first column
             tmp = tmp[:, 1:]
-            # if there's still data, mark this row so it's not picked again
             if tmp.size > 0:
                 tmp[idx, :] = tmp.max() + 1
         return sort_list
-
-
-    def solve(self, puzzle_img: torch.Tensor) -> Tuple[torch.Tensor, Any]:
-        """
-        Args:
-          puzzle_img: Tensor [1,3,H,W] in [0,1], already scrambled
-        Returns:
-          reconstructed [1,3,H,W], and {"order": [...]}
-        """
-        self.load_model()
-        DEVICE = self.device
+        
+    def solve(self, puzzle_img: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """Solve puzzle using the exact sequence of your standalone script."""
+        if self.model is None:
+            self.load_model()
+            
+        # 1) Prepare
+        x = puzzle_img.to(self.device) * 2.0 - 1.0   # [1,3,H,W] in [-1,1]
+        G = self.grid_size
         IMG_SZ = self.image_size
-        G      = self.grid_size
-
-        # 1) Convert input to [-1,1] as in your script
-        x = puzzle_img.to(DEVICE) * 2.0 - 1.0  # [1,3,H,W]
-
-        # 2) Build the 8-D time embeddings
-        #    a) per-puzzle-piece target (3x3 → 9 vectors of dim 8)
-        time_emb = torch.tensor(
-            get_2d_sincos_pos_embed(8, G)
-        ).unsqueeze(0).float().to(DEVICE)       # [1,9,8]
-        #    b) per-token noise (12x12 → 144 vectors of dim 8)
-        tokens_per_side = IMG_SZ // 16
-        noise_emb = torch.tensor(
-            get_2d_sincos_pos_embed(8, tokens_per_side)
-        ).unsqueeze(0).float().to(DEVICE)       # [1,144,8]
-        noise = torch.randn_like(noise_emb)    # [1,144,8]
-
-        # 3) Run diffusion in that 8-D latent space
+        
+        # 2) Time embeddings
+        time_emb       = torch.tensor(get_2d_sincos_pos_embed(8, G))\
+                              .unsqueeze(0).float().to(self.device)     # [1,9,8]
+        tokens_side    = IMG_SZ // 16
+        noise_emb      = torch.tensor(get_2d_sincos_pos_embed(8, tokens_side))\
+                              .unsqueeze(0).float().to(self.device)     # [1,144,8]
+        noise          = torch.randn_like(noise_emb)                     # [1,144,8]
+        
+        # 3) Diffusion in 8-D latent
         samples = self.diffusion.p_sample_loop(
             self.model.forward,
             x,
@@ -131,144 +196,86 @@ class JPDVTSolver(PuzzleSolverModel):
             noise,
             clip_denoised=False,
             model_kwargs=None,
-            device=DEVICE,
+            device=self.device,
             progress=False
         )
-        # samples: [1,144,8]
         latent = samples[0]  # [144,8]
-
-        # 4) Group the 144 token-vectors into 3x3=9 pieces, each 4x4 tokens
-        tp = tokens_per_side // G  # e.g. 12//3 = 4
+        
+        # 4) Group into 3×3 patches (4×4 tokens each)
+        tp = tokens_side // G
         feat = rearrange(
             latent,
             '(p1 h1 p2 w1) d -> (p1 p2) (h1 w1) d',
             p1=G, p2=G, h1=tp, w1=tp
         )  # [9,16,8]
         feat = feat.mean(1).cpu().numpy()  # [9,8]
-
-        # 5) Compare to the 3x3 positional embeddings
+        
+        # 5) Greedy match
         target = time_emb[0].cpu().numpy()  # [9,8]
-        dist   = pairwise_distances(feat, target, metric="manhattan")
-        order  = self.find_permutation(dist)      # list of length 9
-        inv    = np.argsort(order).tolist()      # inverse permutation
-
-        # 6) Reassemble the scrambled image on pixel side
+        dist   = pairwise_distances(feat, target, metric='manhattan')
+        order  = self.find_permutation(dist)
+        inv    = np.argsort(order).tolist()
+        
+        # 6) Reassemble pixels
         pix = rearrange(
             x[0],
             'c (g1 h) (g2 w) -> (g1 g2) c h w',
             g1=G, g2=G,
-            h=IMG_SZ//G,
-            w=IMG_SZ//G
+            h=IMG_SZ//G, w=IMG_SZ//G
         )  # [9,3,H/3,W/3]
         rec_patches = [pix[i] for i in inv]
         rec = rearrange(
             torch.stack(rec_patches),
             '(g1 g2) c h w -> c (g1 h) (g2 w)',
             g1=G, g2=G,
-            h=IMG_SZ//G,
-            w=IMG_SZ//G
+            h=IMG_SZ//G, w=IMG_SZ//G
         )  # [3,H,W]
-
-        # 7) back to [0,1]
+        
+        # 7) Back to [0,1]
         rec = rec * 0.5 + 0.5
         return rec.unsqueeze(0), {"order": inv}
 
 
-class FCViTSolver(PuzzleSolverModel):
-    """Vision‐Transformer–based solver (FCViT)"""
-
-    def __init__(self,
-                 checkpoint_path: str,
-                 backbone: str = "vit_base_patch16_224",
-                 num_fragment: int = 9,
-                 frag_size: int = 75,
-                 puzzle_size: int = 225):
-        self.checkpoint_path = checkpoint_path
-        self.backbone        = backbone
-        self.num_fragment    = num_fragment
-        self.frag_size       = frag_size
-        self.puzzle_size     = puzzle_size
-        self.device          = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model           = None
-
-    @property
-    def name(self) -> str:
-        return "fcvit"
-
-    @property
-    def description(self) -> str:
-        return "Vision Transformer solver (FCViT)"
-
-    def load_model(self) -> None:
-        if self.model is not None:
-            return
-        ckpt   = torch.load(self.checkpoint_path, map_location="cpu")["model"]
-        state  = {k.replace("module.", "", 1): v for k, v in ckpt.items()}
-        self.model = FCViT(
-            backbone=self.backbone,
-            num_fragment=self.num_fragment,
-            size_fragment=self.frag_size
-        ).to(self.device)
-        self.model.load_state_dict(state, strict=True)
-        self.model.eval()
-        self.model.augment_fragment = transforms.Resize(
-            (self.frag_size, self.frag_size), antialias=True
-        )
-
-    def solve(self, puzzle_img: torch.Tensor) -> Tuple[torch.Tensor, Any]:
-        self.load_model()
-        img = puzzle_img.to(self.device)
-        with torch.no_grad():
-            pred, tgt = self.model(img)
-
-        pred_map = self.model.mapping(pred.clone()).cpu()
-        coord    = self.model.map_coord.cpu()
-        mask     = (pred_map[:, None, :] == coord).all(-1).long()
-        idx      = mask.argmax(-1).tolist()
-
-        # rebuild pixel grid
-        def unshuffle(t: torch.Tensor, order: List[int]):
-            C, H, W = t.shape
-            p        = self.frag_size
-            pieces   = [
-                t[:, i:i+p, j:j+p]
-                for i in range(0, H, p)
-                for j in range(0, W, p)
-            ]
-            side = int(np.sqrt(len(order)))
-            grid = [pieces[o] for o in order]
-            rows = [
-                torch.cat(grid[i:i+side], dim=2)
-                for i in range(0, len(order), side)
-            ]
-            return torch.cat(rows, dim=1)
-
-        rec = unshuffle(img[0].cpu(), idx)
-        rec = (rec - rec.min()) / (rec.max() - rec.min())
-        return rec.unsqueeze(0), {"order": idx}
-
-
-# -------------------------------------------------------------------------------
-# Registry for FastAPI
-# -------------------------------------------------------------------------------
+# Registry of available models
 def get_available_models() -> List[Dict[str, str]]:
-    return [
-        {"id": m.name, "name": m.name.upper(), "description": m.description}
-        for m in [
-            JPDVTSolver(checkpoint_path=os.path.join("checkpoints", "2850000.pt")),
-            FCViTSolver(checkpoint_path=os.path.join("checkpoints", "FCViT_base_3x3_ep100_lr3e-05_b64.pt"))
-        ]
+    """Get list of available models"""
+    models = [
+        {
+            "id": "fcvit",
+            "name": "FCViT",
+            "description": "Vision Transformer model for solving image puzzles"
+        },
+        {
+            "id": "jpdvt",
+            "name": "JPDVT",
+            "description": "Diffusion-based model for solving image puzzles"
+        }
     ]
-
+    return models
 
 def get_model_instance(model_id: str) -> PuzzleSolverModel:
-    if model_id == "jpdvt":
-        return JPDVTSolver(checkpoint_path=os.path.join("checkpoints", "2850000.pt"))
+    """Get model instance by ID"""
     if model_id == "fcvit":
-        return FCViTSolver(checkpoint_path=os.path.join("checkpoints", "FCViT_base_3x3_ep100_lr3e-05_b64.pt"))
-    raise ValueError(f"Unknown model_id: {model_id}")
+        ckpt_path = os.path.join(os.getcwd(), "checkpoints/FCViT_base_3x3_ep100_lr3e-05_b64.pt")
+        return FCViTSolver(checkpoint_path=ckpt_path)
+    elif model_id == "jpdvt":
+        ckpt_path = os.path.join(os.getcwd(), "checkpoints/2850000.pt")
+        return JPDVTSolver(checkpoint_path=ckpt_path)
+    else:
+        raise ValueError(f"Model '{model_id}' not found")
 
-
-def solve_puzzle(puzzle_img: torch.Tensor, model_id: str) -> Tuple[torch.Tensor, Any]:
-    solver = get_model_instance(model_id)
-    return solver.solve(puzzle_img)
+def solve_puzzle(puzzle_img: torch.Tensor, model_id: str) -> Tuple[torch.Tensor, Dict]:
+    """Solve puzzle using specified model"""
+    model = get_model_instance(model_id)
+    
+    # Resize the image if needed
+    if model_id == "fcvit" and puzzle_img.shape[-1] != 225:
+        # Resize to 225x225 for FCViT
+        transform = transforms.Resize((225, 225), antialias=True)
+        puzzle_img = transform(puzzle_img)
+    elif model_id == "jpdvt" and puzzle_img.shape[-1] != 192:
+        # Resize to 192x192 for JPDVT
+        transform = transforms.Resize((192, 192), antialias=True)
+        puzzle_img = transform(puzzle_img)
+    
+    return model.solve(puzzle_img)
