@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import torch.nn as nn
 import numpy as np
@@ -11,13 +12,17 @@ from torchvision import transforms
 
 from .base_model import PuzzleSolverModel
 
+# Add external module paths to Python path
+sys.path.append('/cluster/home/muhamhz/fcvit-mt-ntnu')
+sys.path.append('/cluster/home/muhamhz/JPDVT')
+sys.path.append('/cluster/home/muhamhz/JPDVT/image_model')
+
 # Import for the first model
 from puzzle_fcvit import FCViT
 
 # Imports for the second model
 from diffusion import create_diffusion
-from models import DiT_models
-from models import get_2d_sincos_pos_embed
+from models import DiT_models, get_2d_sincos_pos_embed
 
 
 class FCViTSolver(PuzzleSolverModel):

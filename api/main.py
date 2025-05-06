@@ -5,6 +5,7 @@ from fastapi.responses import HTMLResponse
 import os
 import base64
 import torch
+from typing import List  # Add this import
 
 from .schemas import PuzzleRequest, PuzzleResponse, ModelInfo
 from .models import get_available_models, solve_puzzle
@@ -21,7 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/api/models", response_model=list[ModelInfo])
+@app.get("/api/models", response_model=List[ModelInfo])  # Change this line
 async def list_models():
     """Get available puzzle solver models"""
     return get_available_models()
