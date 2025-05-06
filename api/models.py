@@ -257,4 +257,15 @@ def get_model_instance(model_id: str) -> PuzzleSolverModel:
 def solve_puzzle(puzzle_img: torch.Tensor, model_id: str) -> Tuple[torch.Tensor, Dict]:
     """Solve puzzle using specified model"""
     model = get_model_instance(model_id)
+    
+    # Resize the image if needed
+    if model_id == "fcvit" and puzzle_img.shape[-1] != 225:
+        # Resize to 225x225 for FCViT
+        transform = transforms.Resize((225, 225), antialias=True)
+        puzzle_img = transform(puzzle_img)
+    elif model_id == "jpdvt" and puzzle_img.shape[-1] != 192:
+        # Resize to 192x192 for JPDVT
+        transform = transforms.Resize((192, 192), antialias=True)
+        puzzle_img = transform(puzzle_img)
+    
     return model.solve(puzzle_img)
