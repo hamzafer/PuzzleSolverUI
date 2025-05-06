@@ -79,11 +79,16 @@ class FCViTSolver(PuzzleSolverModel):
             pred_gpu, tgt_gpu = self.model(puzzle_img)
         
         pred_ = self.model.mapping(pred_gpu.clone())
-        map_coord = self.model.map_coord.cpu()
+        
+        # Make sure map_coord is on the same device as pred_
+        map_coord = self.model.map_coord.to(pred_.device)  # Move map_coord to the same device
         
         # Extract the ordering information
         mask_pred = (pred_[0][:, None, :] == map_coord).all(-1).long()
         pred_indices = mask_pred.argmax(dim=1).tolist()
+        
+        # Move tensors back to CPU for post-processing
+        img_cpu = puzzle_img[0].cpu()
         
         # Visualize using model's unshuffling logic
         def unshuffle(tensor, order):
@@ -95,7 +100,6 @@ class FCViTSolver(PuzzleSolverModel):
             return torch.cat(rows, dim=1)
         
         # Reconstruct the image
-        img_cpu = puzzle_img[0].cpu()
         reconstructed = unshuffle(img_cpu, pred_indices)
         
         return reconstructed.unsqueeze(0), {"order": pred_indices}
