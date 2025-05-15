@@ -118,7 +118,7 @@ class JPDVTSolver(PuzzleSolverModel):
         self.model           = None
         self.diffusion       = None
         self.device          = "cuda" if torch.cuda.is_available() else "cpu"
-        
+    
     @property
     def name(self) -> str:
         return "JPDVT"
